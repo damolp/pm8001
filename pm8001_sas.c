@@ -260,20 +260,6 @@ int pm8001_phy_control(struct asd_sas_phy *sas_phy, enum phy_func func
 	return rc;
 }
 
-int pm8001_slave_alloc(struct scsi_device *scsi_dev)
-{
-	struct domain_device *dev = sdev_to_domain_dev(scsi_dev);
-	if (dev_is_sata(dev)) {
-		/* We don't need to rescan targets
-		* if REPORT_LUNS request is failed
-		*/
-		if (scsi_dev->lun > 0)
-			return -ENXIO;
-		scsi_dev->tagged_supported = 1;
-	}
-	return sas_slave_alloc(scsi_dev);
-}
-
 /**
   * pm8001_scan_start - we should enable all HBA phys by sending the phy_start
   * command to HBA.
@@ -401,8 +387,8 @@ static int sas_find_local_port_id(struct domain_device *dev)
   * @tmf: the task management IU
   */
 #define DEV_IS_GONE(pm8001_dev)	\
-	(!pm8001_dev || (pm8001_dev->dev_type == NO_DEVICE) || (pm8001_dev->dying))
-static int pm8001_task_exec(struct sas_task *task, const int num,
+	(!pm8001_dev || (pm8001_dev->dev_type == SAS_PHY_UNUSED) || (pm8001_dev->dying))
+static int pm8001_task_exec(struct sas_task *task,
 	gfp_t gfp_flags, int is_tmf, struct pm8001_tmf_task *tmf)
 {
 	struct domain_device *dev = task->dev;
@@ -412,14 +398,13 @@ static int pm8001_task_exec(struct sas_task *task, const int num,
 	struct sas_task *t = task;
 	struct pm8001_ccb_info *ccb;
 	u32 tag = 0xdeadbeef, rc, n_elem = 0;
-	u32 n = num;
 	unsigned long flags = 0, flags_libsas = 0;
 
 	if (!dev->port) {
 		struct task_status_struct *tsm = &t->task_status;
 		tsm->resp = SAS_TASK_UNDELIVERED;
 		tsm->stat = SAS_PHY_DOWN;
-		if (dev->dev_type != SATA_DEV)
+		if (dev->dev_type != SAS_SATA_DEV)
 			t->task_done(t);
 		return 0;
 	}
@@ -443,18 +428,12 @@ static int pm8001_task_exec(struct sas_task *task, const int num,
 				spin_lock_irqsave(dev->sata_dev.ap->lock,
 					flags_libsas);
 				spin_lock_irqsave(&pm8001_ha->lock, flags);
-				if (n > 1)
-					t = list_entry(t->list.next,
-							struct sas_task, list);
 				continue;
 			} else {
 				struct sas_task *tt = t;
 				struct task_status_struct *ts = &t->task_status;
 				ts->resp = SAS_TASK_UNDELIVERED;
 				ts->stat = SAS_PHY_DOWN;
-				if (n > 1)
-					t = list_entry(t->list.next,
-							struct sas_task, list);
 				spin_unlock_irqrestore(&pm8001_ha->lock, flags);
 				tt->task_done(tt);
 				spin_lock_irqsave(&pm8001_ha->lock, flags);
@@ -463,7 +442,6 @@ static int pm8001_task_exec(struct sas_task *task, const int num,
 		}
 		rc = pm8001_tag_alloc(pm8001_ha, &tag);
 		if (rc) {
-			BUG_ON(n > 1);
 			goto err_out;
 		}
 
@@ -476,7 +454,6 @@ static int pm8001_task_exec(struct sas_task *task, const int num,
 					t->data_dir);
 				if (!n_elem) {
 					rc = -ENOMEM;
-					BUG_ON(n > 1);
 					goto err_out_tag;
 				}
 			}
@@ -516,16 +493,13 @@ static int pm8001_task_exec(struct sas_task *task, const int num,
 		if (rc) {
 			PM8001_IO_DBG(pm8001_ha,
 				pm8001_printk("rc is %x\n", rc));
-			BUG_ON(n > 1);
 			goto err_out_tag;
 		}
 		/* TODO: select normal or high priority */
 		spin_lock(&t->task_state_lock);
 		t->task_state_flags |= SAS_TASK_AT_INITIATOR;
 		spin_unlock(&t->task_state_lock);
-		if (n > 1)
-			t = list_entry(t->list.next, struct sas_task, list);
-	} while (--n);
+	} while (0);
 	rc = 0;
 	goto out_done;
 
@@ -552,10 +526,10 @@ out_done:
   * we always execute one one time
   * @gfp_flags: gfp_flags
   */
-int pm8001_queue_command(struct sas_task *task, const int num,
+int pm8001_queue_command(struct sas_task *task,
 		PMCS_GFP_T gfp_flags)
 {
-	return pm8001_task_exec(task, num, gfp_flags, 0, NULL);
+	return pm8001_task_exec(task, gfp_flags, 0, NULL);
 }
 
 void pm8001_ccb_free(struct pm8001_hba_info *pm8001_ha, u32 ccb_idx)
@@ -615,7 +589,7 @@ struct pm8001_device *pm8001_alloc_dev(struct pm8001_hba_info *pm8001_ha)
 {
 	u32 dev;
 	for (dev = 0; dev < PM8001_MAX_DEVICES; dev++) {
-		if (pm8001_ha->devices[dev].dev_type == NO_DEVICE) {
+		if (pm8001_ha->devices[dev].dev_type == SAS_PHY_UNUSED) {
 			pm8001_ha->devices[dev].id = dev;
 			return &pm8001_ha->devices[dev];
 		}
@@ -636,7 +610,7 @@ static void pm8001_free_dev(struct pm8001_hba_info *pm8001_ha, struct pm8001_dev
 	u32 id = pm8001_dev->id;
 	memset(pm8001_dev, 0, sizeof(*pm8001_dev));
 	pm8001_dev->id = id;
-	pm8001_dev->dev_type = NO_DEVICE;
+	pm8001_dev->dev_type = SAS_PHY_UNUSED;
 	pm8001_dev->device_id = PM8001_MAX_DEVICES;
 }
 
@@ -694,7 +668,7 @@ static int pm8001_dev_found_notify(struct domain_device *dev)
 			goto found_out;
 		}
 	} else {
-		if (dev->dev_type == SATA_DEV) {
+		if (dev->dev_type == SAS_SATA_DEV) {
 			pm8001_device->attached_phy =
 				dev->rphy->identify.phy_identifier;
 				flag = 1; /* directly sata*/
@@ -707,7 +681,7 @@ static int pm8001_dev_found_notify(struct domain_device *dev)
 	spin_unlock_irqrestore(&pm8001_ha->lock, flags);
 	wait_for_completion(&completion);
 	PM8001_DISC_DBG(pm8001_ha, pm8001_printk("Found device [%d:%x]\n", pm8001_device->device_id, pm8001_device->dev_type));
-	if (dev->dev_type == SAS_END_DEV)
+	if (dev->dev_type == SAS_END_DEVICE)
 		msleep(50);
 	pm8001_ha->flags = PM8001F_RUN_TIME;
 	return 0;
@@ -729,30 +703,21 @@ int pm8001_dev_found(struct domain_device *dev)
   */
 static struct sas_task *pm8001_alloc_task(void)
 {
-	struct sas_task *task = PMALLOC(sizeof(*task), GFP_KERNEL);
-	if (task) {
-		INIT_LIST_HEAD(&task->list);
-		spin_lock_init(&task->task_state_lock);
-		task->task_state_flags = SAS_TASK_STATE_PENDING;
-		init_timer(&task->timer);
-		init_completion(&task->completion);
-	}
-	return task;
+	return sas_alloc_slow_task(GFP_KERNEL); // TODO ENOMEM CHECK
 }
 
 static void pm8001_free_task(struct sas_task *task)
 {
 	if (task) {
-		BUG_ON(!list_empty(&task->list));
-		PMFREE(task, sizeof (*task));
+		sas_free_task(task);
 	}
 }
 
 static void pm8001_task_done(struct sas_task *task)
 {
-	if (!del_timer(&task->timer))
+	if (!del_timer(&task->slow_task->timer))
 		return;
-	complete(&task->completion);
+	complete(&task->slow_task->completion);
 }
 
 static void pm8001_tmf_timedout(unsigned long data)
@@ -765,7 +730,7 @@ static void pm8001_tmf_timedout(unsigned long data)
 		task->task_state_flags |= SAS_TASK_STATE_ABORTED;
 	}
 	spin_unlock_irqrestore(&task->task_state_lock, flags);
-	complete(&task->completion);
+	complete(&task->slow_task->completion);
 }
 
 #define PM8001_TASK_TIMEOUT 20
@@ -801,21 +766,21 @@ static int pm8001_exec_internal_tmf_task(struct domain_device *dev,
 		task->task_proto = dev->tproto;
 		memcpy(&task->ssp_task, parameter, para_len);
 		task->task_done = pm8001_task_done;
-		task->timer.data = (unsigned long)task;
-		task->timer.function = pm8001_tmf_timedout;
-		task->timer.expires = jiffies + PM8001_TASK_TIMEOUT*HZ;
-		add_timer(&task->timer);
+		task->slow_task->timer.data = (unsigned long)task;
+		task->slow_task->timer.function = pm8001_tmf_timedout;
+		task->slow_task->timer.expires = jiffies + PM8001_TASK_TIMEOUT*HZ;
+		add_timer(&task->slow_task->timer);
 
-		res = pm8001_task_exec(task, 1, GFP_KERNEL, 1, tmf);
+		res = pm8001_task_exec(task, GFP_KERNEL, 1, tmf);
 
 		if (res) {
-			del_timer(&task->timer);
+			del_timer(&task->slow_task->timer);
 			PM8001_FAIL_DBG(pm8001_ha,
 				pm8001_printk("Executing internal task "
 				"failed\n"));
 			goto ex_err;
 		}
-		wait_for_completion(&task->completion);
+		wait_for_completion(&task->slow_task->completion);
 		/*
 		 * We have to be careful here. If the task management timer timed out (pm8001_tmf_timedout),
 		 * we may have an active CCB in play, so we have to get the HBA lock first and then the
@@ -889,10 +854,10 @@ pm8001_exec_internal_task_abort(struct pm8001_hba_info *pm8001_ha,
 		task->dev = dev;
 		task->task_proto = dev->tproto;
 		task->task_done = pm8001_task_done;
-		task->timer.data = (unsigned long)task;
-		task->timer.function = pm8001_tmf_timedout;
-		task->timer.expires = jiffies + PM8001_TASK_TIMEOUT * HZ;
-		add_timer(&task->timer);
+		task->slow_task->timer.data = (unsigned long)task;
+		task->slow_task->timer.function = pm8001_tmf_timedout;
+		task->slow_task->timer.expires = jiffies + PM8001_TASK_TIMEOUT * HZ;
+		add_timer(&task->slow_task->timer);
 
 		res = TMF_RESP_FUNC_FAILED;
 		spin_lock_irqsave(&pm8001_ha->lock, flags);
@@ -909,7 +874,7 @@ pm8001_exec_internal_task_abort(struct pm8001_hba_info *pm8001_ha,
 			pm8001_dev, abort_all, task_tag, ccb_tag);
 
 		if (res) {
-			del_timer(&task->timer);
+			del_timer(&task->slow_task->timer);
 			spin_unlock_irqrestore(&pm8001_ha->lock, flags);
 			PM8001_FAIL_DBG(pm8001_ha,
 				pm8001_printk("Executing internal task "
@@ -918,7 +883,7 @@ pm8001_exec_internal_task_abort(struct pm8001_hba_info *pm8001_ha,
 		}
 		spin_unlock_irqrestore(&pm8001_ha->lock, flags);
 
-		wait_for_completion(&task->completion);
+		wait_for_completion(&task->slow_task->completion);
 		/*
 		 * We have to be careful here. If the task management timer timed out (pm8001_tmf_timedout),
 		 * we may have an active CCB in play, so we have to get the HBA lock first and then the
@@ -1130,7 +1095,7 @@ void pm8001_open_reject_retry(
 		u32 tag;
 
 		pm8001_dev = ccb->device;
-		if (!pm8001_dev || (pm8001_dev->dev_type == NO_DEVICE))
+		if (!pm8001_dev || (pm8001_dev->dev_type == SAS_PHY_UNUSED))
 			continue;
 		if (!device_to_close) {
 			uintptr_t d = (uintptr_t)pm8001_dev
@@ -1195,7 +1160,7 @@ int pm8001_I_T_nexus_reset(struct domain_device *dev)
 
 	pm8001_dev = dev->lldd_dev;
 	pm8001_ha = pm8001_find_ha_by_dev(dev);
-	phy = sas_find_local_phy(dev);
+	phy = sas_get_local_phy(dev);
 
 	if (dev_is_sata(dev)) {
 		DECLARE_COMPLETION_ONSTACK(completion_setstate);
@@ -1242,7 +1207,7 @@ int pm8001_lu_reset(struct domain_device *dev, u8 *lun)
 	pm8001_ha = pm8001_find_ha_by_dev(dev);
 
 	if (dev_is_sata(dev)) {
-		struct sas_phy *phy = sas_find_local_phy(dev);
+		struct sas_phy *phy = sas_get_local_phy(dev);
 		rc = pm8001_exec_internal_task_abort(pm8001_ha, pm8001_dev,
 			dev, 1, 0);
 		rc = sas_phy_reset(phy, 1);
@@ -1505,12 +1470,12 @@ static void pm8001_reregister_dev(struct pm8001_hba_info *pm8001_ha)
 		DECLARE_COMPLETION_ONSTACK(completion);
 		struct pm8001_device *pm8001_dev = &pm8001_ha->devices[i];
 
-		if (pm8001_dev->dev_type == NO_DEVICE)
+		if (pm8001_dev->dev_type == SAS_PHY_UNUSED)
 			continue;
 
 		direct = 0;
 		dev = pm8001_dev->sas_device;
-		if (dev && !dev->parent && (dev->dev_type == SATA_DEV))
+		if (dev && !dev->parent && (dev->dev_type == SAS_SATA_DEV))
 			direct = 1;
 		pm8001_dev->dcompletion = &completion;
 		spin_lock_irqsave(&pm8001_ha->lock, flags);

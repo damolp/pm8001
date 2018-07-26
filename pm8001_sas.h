@@ -124,7 +124,7 @@ do {						\
 #define PM8001_USE_MSIX
 #define PM8001_READ_VPD
 
-#define DEV_IS_EXPANDER(type)	((type == EDGE_DEV) || (type == FANOUT_DEV))
+#define DEV_IS_EXPANDER(type)	((type == SAS_EDGE_EXPANDER_DEVICE) || (type == SAS_FANOUT_EXPANDER_DEVICE))
 
 #define PM8001_NAME_LENGTH		32/* generic length of strings */
 extern struct list_head hba_list;
@@ -227,7 +227,7 @@ struct pm8001_phy {
 };
 
 struct pm8001_device {
-	enum sas_dev_type	dev_type;
+	enum sas_device_type	dev_type;
 	struct domain_device	*sas_device;
 	u32			attached_phy;
 	u32			id;
@@ -769,11 +769,10 @@ void pm8001_ccb_task_free(struct pm8001_hba_info *pm8001_ha,
 	struct sas_task *task, struct pm8001_ccb_info *ccb, u32 ccb_idx);
 int pm8001_phy_control(struct asd_sas_phy *sas_phy, enum phy_func func
 	PMCS_FUNCDATA_ARG);
-int pm8001_slave_alloc(struct scsi_device *scsi_dev);
 int pm8001_slave_configure(struct scsi_device *sdev);
 void pm8001_scan_start(struct Scsi_Host *shost);
 int pm8001_scan_finished(struct Scsi_Host *shost, unsigned long time);
-int pm8001_queue_command(struct sas_task *task, const int num,
+int pm8001_queue_command(struct sas_task *task,
 	PMCS_GFP_T gfp_flags);
 int pm8001_abort_task(struct sas_task *task);
 int pm8001_abort_task_set(struct domain_device *dev, u8 *lun);

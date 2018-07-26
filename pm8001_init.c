@@ -73,11 +73,9 @@ static struct scsi_host_template pm8001_sht = {
 	.queuecommand		= sas_queuecommand,
 	.target_alloc		= sas_target_alloc,
 	.slave_configure	= pm8001_slave_configure,
-	.slave_destroy		= sas_slave_destroy,
 	.scan_finished		= pm8001_scan_finished,
 	.scan_start		= pm8001_scan_start,
 	.change_queue_depth	= sas_change_queue_depth,
-	.change_queue_type	= sas_change_queue_type,
 	.bios_param		= sas_bios_param,
 	.can_queue		= 1,
 	.cmd_per_lun		= 1,
@@ -88,7 +86,6 @@ static struct scsi_host_template pm8001_sht = {
 	.eh_device_reset_handler = sas_eh_device_reset_handler,
 	.eh_bus_reset_handler	= pm8001_eh_bus_reset_handler,
 	.eh_host_reset_handler	= pm8001_eh_host_reset_handler,
-	.slave_alloc		= pm8001_slave_alloc,
 	.target_destroy		= sas_target_destroy,
 	.ioctl			= sas_ioctl,
 	.shost_attrs		= pm8001_host_attrs,
@@ -119,7 +116,7 @@ static struct sas_domain_function_template pm8001_transport_ops = {
  *@pm8001_ha: our hba structure.
  *@phy_id: phy id.
  */
-static void __devinit pm8001_phy_init(struct pm8001_hba_info *pm8001_ha,
+static void pm8001_phy_init(struct pm8001_hba_info *pm8001_ha,
 	int phy_id)
 {
 	struct pm8001_phy *phy = &pm8001_ha->phy[phy_id];
@@ -215,7 +212,7 @@ static irqreturn_t pm8001_interrupt(int irq, void *opaque EXTRA_IRQ_ARGS)
  * @pm8001_ha:our hba structure.
  *
  */
-static int __devinit pm8001_alloc(struct pm8001_hba_info *pm8001_ha)
+static int pm8001_alloc(struct pm8001_hba_info *pm8001_ha)
 {
 	int i;
 	spin_lock_init(&pm8001_ha->lock);
@@ -317,7 +314,7 @@ static int __devinit pm8001_alloc(struct pm8001_hba_info *pm8001_ha)
 
 	pm8001_ha->devices = pm8001_ha->memoryMap.region[DEV_MEM].virt_ptr;
 	for (i = 0; i < PM8001_MAX_DEVICES; i++) {
-		pm8001_ha->devices[i].dev_type = NO_DEVICE;
+		pm8001_ha->devices[i].dev_type = SAS_PHY_UNUSED;
 		pm8001_ha->devices[i].id = i;
 		pm8001_ha->devices[i].device_id = PM8001_MAX_DEVICES;
 		pm8001_ha->devices[i].running_req = 0;
@@ -414,8 +411,7 @@ static int pm8001_ioremap(struct pm8001_hba_info *pm8001_ha)
  * @ent: ent
  * @shost: scsi host struct which has been initialized before.
  */
-static struct pm8001_hba_info *__devinit
-pm8001_pci_alloc(struct pci_dev *pdev, u32 chip_id, struct Scsi_Host *shost)
+static struct pm8001_hba_info* pm8001_pci_alloc(struct pci_dev *pdev, u32 chip_id, struct Scsi_Host *shost)
 {
 	struct pm8001_hba_info *pm8001_ha;
 	struct sas_ha_struct *sha = SHOST_TO_SAS_HA(shost);
@@ -488,7 +484,7 @@ static int pci_go_44(struct pci_dev *pdev)
  * @shost: scsi host which has been allocated outside.
  * @chip_info: our ha struct.
  */
-static int __devinit pm8001_prep_sas_ha_init(struct Scsi_Host * shost,
+static int pm8001_prep_sas_ha_init(struct Scsi_Host * shost,
 	const struct pm8001_chip_info *chip_info)
 {
 	int phy_nr, port_nr;
@@ -534,7 +530,7 @@ exit:
  * @shost: scsi host which has been allocated outside
  * @chip_info: our ha struct.
  */
-static void  __devinit pm8001_post_sas_ha_init(struct Scsi_Host *shost,
+static void pm8001_post_sas_ha_init(struct Scsi_Host *shost,
 	const struct pm8001_chip_info *chip_info)
 {
 	int i = 0;
@@ -552,8 +548,6 @@ static void  __devinit pm8001_post_sas_ha_init(struct Scsi_Host *shost,
 	sha->lldd_module = THIS_MODULE;
 	sha->sas_addr = &pm8001_ha->sas_addr[0][0];
 	sha->num_phys = chip_info->n_phy;
-	sha->lldd_max_execute_num = 1;
-	sha->lldd_queue_size = PM8001_CAN_QUEUE;
 	sha->core.shost = shost;
 }
 
@@ -700,7 +694,6 @@ static u32 pm8001_setup_msix(struct pm8001_hba_info *pm8001_ha,
 	int rc;
 	max_entry = sizeof(pm8001_ha->msix_entries) /
 		sizeof(pm8001_ha->msix_entries[0]);
-	flag |= IRQF_DISABLED;
 	for (i = 0; i < max_entry ; i++)
 		pm8001_ha->msix_entries[i].entry = i;
 	rc = pci_enable_msix(pm8001_ha->pdev, pm8001_ha->msix_entries,
@@ -782,7 +775,7 @@ pm8001_scan(void *arg)
  * pci driver it is invoked, all struct and hardware initialization should be
  * done here, also, register interrupt
  */
-static int __devinit pm8001_pci_probe(struct pci_dev *pdev,
+static int pm8001_pci_probe(struct pci_dev *pdev,
 	const struct pci_device_id *ent)
 {
 	unsigned int rc = -ENODEV;
@@ -922,7 +915,7 @@ err_out_enable:
 	return rc;
 }
 
-static void __devexit pm8001_pci_remove(struct pci_dev *pdev)
+static void pm8001_pci_remove(struct pci_dev *pdev)
 {
 	struct sas_ha_struct *sha = pci_get_drvdata(pdev);
 	struct pm8001_hba_info *pm8001_ha;
@@ -1060,7 +1053,7 @@ err_out_enable:
 	return rc;
 }
 
-static struct pci_device_id __devinitdata pm8001_pci_table[] = {
+static struct pci_device_id pm8001_pci_table[] = {
 	{
 		PCI_VDEVICE(PMC_Sierra, 0x8001), chip_8001
 	},
@@ -1075,7 +1068,7 @@ static struct pci_driver pm8001_pci_driver = {
 	.name		= DRV_NAME,
 	.id_table	= pm8001_pci_table,
 	.probe		= pm8001_pci_probe,
-	.remove		= __devexit_p(pm8001_pci_remove),
+	.remove		= pm8001_pci_remove,
 	.suspend	= pm8001_pci_suspend,
 	.resume		= pm8001_pci_resume,
 };
@@ -1140,12 +1133,13 @@ MODULE_PARM_DESC(disable, "Disable Driver");
 module_init(pm8001_init);
 module_exit(pm8001_exit);
 
+MODULE_AUTHOR("damolp <damo@dlp.id.au>");
 MODULE_AUTHOR("Kongkon Jyoti Dutta <Kongkon.Dutta@seagate.com>");
 MODULE_AUTHOR("Mark Salyzyn <Mark_Salyzyn@xyratex.com>");
 MODULE_AUTHOR("Matt Jacob <a-Matt_Jacob@xyratex.com>");
 MODULE_AUTHOR("Wing Lam <wlam@us.xyratex.com>");
 MODULE_AUTHOR("Jack Wang <jack_wang@usish.com>");
-MODULE_DESCRIPTION("PMC-Sierra PM8001 SAS/SATA controller driver");
+MODULE_DESCRIPTION("PMC-Sierra PM8001 SAS/SATA Flashless controller driver");
 MODULE_VERSION(DRV_VERSION);
 MODULE_LICENSE("GPL");
 MODULE_DEVICE_TABLE(pci, pm8001_pci_table);

@@ -34,10 +34,6 @@ KDIR 	:= $(firstword \
 		$(wildcard ./KDIR) \
 		$(wildcard /lib/modules/$(KVER)/build) \
 		$(wildcard /usr/src/kernels/$(KVER)))
-# Old kernel Or use the KDIR softlink
-# KDIR	:= /home/scratch/kongkon-ssbuild/ssbuild/FP7.5-drop1/mscsa-321/mscsa-thirdparty/CentOS/BUILD/kernel-2.6.32-220.el6/linux-2.6.32-220.el6.x86_64/
-# New kernel or do not use the KDIR soft link
-KDIR	:= /home/kdutta/ssbuild/FP7.8/mscsa-thirdparty/CentOS/BUILD/kernel-2.6.32-220.el6/linux-2.6.32-220.el6.x86_64/
 PWD    := $(shell pwd)
 SRCFILES := *.bin pm8001install *.[ch] *.txt *.spec Makefile
 BINFILES := *.bin pm8001install release.txt $(DRV_NAME).ko

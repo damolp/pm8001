@@ -742,7 +742,7 @@ static ssize_t pm8001_show_update_fw(struct PMCS_SYSFS_DEV *cdev,
 			flash_error_table[i].reason);
 }
 
-static PMCS_DEVICE_ATTR(update_fw, S_IRUGO|S_IWUGO,
+static PMCS_DEVICE_ATTR(update_fw, S_IRUGO|S_IWUSR|S_IWGRP,
 	pm8001_show_update_fw, pm8001_store_update_fw);
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 19)
 struct PMCS_SYSFS_DEV_ATTR *pm8001_host_attrs[] = {
