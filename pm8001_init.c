@@ -51,7 +51,7 @@ static const struct pm8001_chip_info pm8001_chips[] = {
 	[chip_8001] = {  8, &pm8001_8001_dispatch,},
 };
 static int pm8001_id;
-static int pm8001_logging_level = PM8001_FAIL_LOGGING;
+static int pm8001_logging_level = PM8001_FAIL_LOGGING | PM8001_INIT_LOGGING;
 static int pm8001_logging_option;
 static int pm8001_logging_size = PM8001_EVENT_LOG_SIZE;
 static ulong pm8001_wwn_by4;
@@ -396,6 +396,8 @@ static int pm8001_ioremap(struct pm8001_hba_info *pm8001_ha)
 				pm8001_ha->io_mem[logicalBar].memvirtaddr,
 				pm8001_ha->io_mem[logicalBar].memsize));
 		} else {
+			PM8001_INIT_DBG(pm8001_ha,
+				pm8001_printk("Zeroing Out PCI: bar %d, logicalBar %d", bar, logicalBar));
 			pm8001_ha->io_mem[logicalBar].membase	= 0;
 			pm8001_ha->io_mem[logicalBar].memsize	= 0;
 			pm8001_ha->io_mem[logicalBar].memvirtaddr = 0;
