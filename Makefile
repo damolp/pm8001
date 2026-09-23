@@ -5,13 +5,27 @@
 # Copyright (C) 2008-2009  USI Co., Ltd.
 
 
-obj-$(CONFIG_SCSI_PM8001) += pm80xx.o
+KVER ?= $(shell uname -r)
+KDIR ?= /lib/modules/$(KVER)/build
+PWD  := $(shell pwd)
 
-CFLAGS_pm80xx_tracepoints.o := -I$(src)
+FIRMWARE_DIR ?= /lib/firmware/pm8001
+FIRMWARE     := istrimg.bin ilaimg.bin aap1img.bin iopimg.bin
 
-pm80xx-y += pm8001_init.o \
-		pm8001_sas.o  \
-		pm8001_ctl.o  \
-		pm8001_hwi.o  \
-		pm80xx_hwi.o  \
-		pm80xx_tracepoints.o
+.PHONY: all modules clean install install-firmware
+
+all: modules
+
+modules:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+
+install:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
+	depmod -a $(KVER)
+
+install-firmware:
+	install -d -m 0755 $(DESTDIR)$(FIRMWARE_DIR)
+	install -m 0644 $(addprefix firmware/,$(FIRMWARE)) $(DESTDIR)$(FIRMWARE_DIR)/
