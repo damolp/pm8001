@@ -38,6 +38,8 @@
  *
  */
  #include <linux/slab.h>
+ #include <linux/firmware.h>
+ #include <linux/unaligned.h>
  #include "pm8001_sas.h"
  #include "pm8001_hwi.h"
  #include "pm8001_chips.h"
@@ -640,10 +642,382 @@ static void init_pci_device_addresses(struct pm8001_hba_info *pm8001_ha)
 		base_addr + pm8001_cr32(pm8001_ha, pcibar, offset + 0x20);
 }
 
-/**
- * pm8001_chip_init - the main init function that initialize whole PM8001 chip.
- * @pm8001_ha: our hba card information
- */
+// flashless firmware files
+struct pm8001_hda_fw {
+	const struct firmware *istr;
+	const struct firmware *ila;
+	const struct firmware *aap1;
+	const struct firmware *iop;
+};
+
+// flashless sanity check - i've only seen the StorSimple w/a PM8001 in this mode
+static bool pm8001_hda_is_flashless(struct pm8001_hba_info *pm8001_ha)
+{
+	return pm8001_ha->pdev->device == 0x8001;
+}
+
+// flashless - from 2.6 pm8001_ishdar_idle
+static bool pm8001_hda_idle(struct pm8001_hba_info *pm8001_ha)
+{
+	u32 rsp;
+
+	if (!pm8001_hda_is_flashless(pm8001_ha))
+		return false;
+	if (pm8001_ha->io_mem[3].memsize < HDA_RSP_OFFSET + 32)
+		return false;
+
+	rsp = pm8001_cr32(pm8001_ha, 3, HDA_RSP_OFFSET + HDA_CMD_RSP_CODE_DW);
+	return ((rsp & HDA_PA_BITS) >> 24) == HDA_R_PA &&
+	       (rsp & HDA_CODE_BITS) == HDA_RSP_IDLE;
+}
+
+// flashless - from 2.6 pm8001_hda_send_cmd
+static void pm8001_hda_send_cmd(struct pm8001_hba_info *pm8001_ha,
+				const u32 *args, u32 num_args, u32 cmd)
+{
+	u32 seq;
+	u32 i;
+
+	for (i = 0; i < num_args; i++)
+		pm8001_cw32(pm8001_ha, 3, HDA_CMD_OFFSET + i * 4, args[i]);
+
+	seq = pm8001_cr32(pm8001_ha, 3, HDA_CMD_OFFSET + HDA_CMD_RSP_CODE_DW);
+	seq = (seq & HDA_SEQ_ID_BITS) >> 16;
+	seq = (seq == 0xff) ? 1 : seq + 1;
+	pm8001_cw32(pm8001_ha, 3, HDA_CMD_OFFSET + HDA_CMD_RSP_CODE_DW,
+		    ((u32)HDA_C_PA << 24) | (seq << 16) | cmd);
+}
+
+// flashless - see 2.6 pm8001_hda_recv_rsp
+static int pm8001_hda_wait_exec_rsp(struct pm8001_hba_info *pm8001_ha)
+{
+	unsigned long timeout = jiffies + msecs_to_jiffies(PM8001_HDA_TIMEOUT_MS);
+	u32 rsp = 0;
+
+	do {
+		msleep(PM8001_HDA_POLL_MS);
+		rsp = pm8001_cr32(pm8001_ha, 3,
+				  HDA_RSP_OFFSET + HDA_CMD_RSP_CODE_DW);
+		if (((rsp & HDA_PA_BITS) >> 24) != HDA_R_PA)
+			continue;
+		switch (rsp & HDA_CODE_BITS) {
+		case HDA_RSP_EXEC:
+			pm8001_dbg(pm8001_ha, INIT, "HDA: ILA accepted\n");
+			return 0;
+		case HDA_RSP_BAD_IMG:
+		case HDA_RSP_BAD_CMD:
+		case HDA_RSP_INTL_ERR:
+			pm8001_dbg(pm8001_ha, FAIL,
+				   "HDA: boot ROM rejected the ILA, rsp=0x%x\n",
+				   rsp);
+			return -EIO;
+		}
+	} while (time_before(jiffies, timeout));
+	pm8001_dbg(pm8001_ha, INIT,
+		   "HDA: no EXEC response from boot ROM (0x%x), continuing\n",
+		   rsp);
+	return 0;
+}
+
+// flashless - see 2.6 pm8001_bar4_cpy
+static int pm8001_hda_gsm_copy(struct pm8001_hba_info *pm8001_ha,
+			       u32 gsm_addr, const u8 *data, size_t len)
+{
+	u32 window = gsm_addr & MB3_SHIFT_MASK;
+	u32 offset = gsm_addr & MB3_OFFSET_MASK;
+	unsigned long flags;
+	int rc;
+
+	if (gsm_addr & 3) {
+		pm8001_dbg(pm8001_ha, FAIL,
+			   "HDA: unaligned GSM address 0x%x\n", gsm_addr);
+		return -EINVAL;
+	}
+	if (pm8001_ha->io_mem[2].memsize < SIZE_64KB) {
+		pm8001_dbg(pm8001_ha, FAIL,
+			   "HDA: BAR2 window too small (0x%x)\n",
+			   pm8001_ha->io_mem[2].memsize);
+		return -ENXIO;
+	}
+
+	pm8001_dbg(pm8001_ha, INIT, "HDA: copy %zu bytes to GSM 0x%x\n",
+		   len, gsm_addr);
+
+	while (len) {
+		size_t chunk = min_t(size_t, len, SIZE_64KB - offset);
+		size_t i;
+
+		spin_lock_irqsave(&pm8001_ha->lock, flags);
+		if (-1 == pm8001_bar4_shift(pm8001_ha, window)) {
+			spin_unlock_irqrestore(&pm8001_ha->lock, flags);
+			pm8001_dbg(pm8001_ha, FAIL,
+				   "HDA: Shift Bar4 to 0x%x failed\n", window);
+			return -EIO;
+		}
+		for (i = 0; i < chunk; i += 4) {
+			u32 val;
+
+			if (chunk - i >= 4) {
+				val = get_unaligned_le32(data + i);
+			} else {
+				/* zero pad a trailing partial dword */
+				u8 tail[4] = {};
+
+				memcpy(tail, data + i, chunk - i);
+				val = get_unaligned_le32(tail);
+			}
+			pm8001_cw32(pm8001_ha, 2, offset + i, val);
+		}
+		spin_unlock_irqrestore(&pm8001_ha->lock, flags);
+
+		data += chunk;
+		len -= chunk;
+		window += SIZE_64KB;
+		offset = 0;
+	}
+
+	spin_lock_irqsave(&pm8001_ha->lock, flags);
+	rc = pm8001_bar4_shift(pm8001_ha, 0);
+	spin_unlock_irqrestore(&pm8001_ha->lock, flags);
+	return rc == -1 ? -EIO : 0;
+}
+
+// flashless
+static int pm8001_hda_poll_ila(struct pm8001_hba_info *pm8001_ha, u32 state,
+			       u32 *gsm_offset)
+{
+	unsigned long timeout = jiffies + msecs_to_jiffies(PM8001_HDA_TIMEOUT_MS);
+	u32 reg = 0;
+
+	do {
+		msleep(PM8001_HDA_POLL_MS);
+		reg = pm8001_cr32(pm8001_ha, 0, MSGU_SCRATCH_PAD_0);
+		if (((reg & ILA_HDA_STATE_MASK) >> 24) == state) {
+			*gsm_offset = reg & ILA_HDA_OFFSET_MASK;
+			return 0;
+		}
+	} while (time_before(jiffies, timeout));
+	pm8001_dbg(pm8001_ha, FAIL,
+		   "HDA: timeout waiting for ILA state 0x%x: SCRATCH_PAD0=0x%x SCRATCH_PAD1=0x%x SCRATCH_PAD2=0x%x\n",
+		   state, reg,
+		   pm8001_cr32(pm8001_ha, 0, MSGU_SCRATCH_PAD_1),
+		   pm8001_cr32(pm8001_ha, 0, MSGU_SCRATCH_PAD_2));
+	return -ETIMEDOUT;
+}
+
+// flashless
+static int pm8001_hda_wait_fw_ready(struct pm8001_hba_info *pm8001_ha)
+{
+	unsigned long timeout = jiffies + msecs_to_jiffies(PM8001_HDA_TIMEOUT_MS);
+	u32 pad1 = 0, pad2 = 0;
+
+	do {
+		msleep(PM8001_HDA_POLL_MS);
+		pad1 = pm8001_cr32(pm8001_ha, 0, MSGU_SCRATCH_PAD_1);
+		pad2 = pm8001_cr32(pm8001_ha, 0, MSGU_SCRATCH_PAD_2);
+		if ((pad1 & SCRATCH_PAD1_RDY) == SCRATCH_PAD1_RDY &&
+		    (pad2 & SCRATCH_PAD2_RDY) == SCRATCH_PAD2_RDY)
+			return 0;
+	} while (time_before(jiffies, timeout));
+	pm8001_dbg(pm8001_ha, FAIL,
+		   "HDA: firmware not ready: SCRATCH_PAD1=0x%x SCRATCH_PAD2=0x%x\n",
+		   pad1, pad2);
+	return -ETIMEDOUT;
+}
+
+// flashless
+static void pm8001_hda_release_fw(struct pm8001_hda_fw *fw)
+{
+	release_firmware(fw->istr);
+	release_firmware(fw->ila);
+	release_firmware(fw->aap1);
+	release_firmware(fw->iop);
+	memset(fw, 0, sizeof(*fw));
+}
+
+// flashless
+static int pm8001_hda_request_fw(struct pm8001_hba_info *pm8001_ha,
+				 struct pm8001_hda_fw *fw)
+{
+	static const char * const names[] = {
+		PM8001_FW_ISTR, PM8001_FW_ILA, PM8001_FW_AAP1, PM8001_FW_IOP,
+	};
+	const struct firmware **imgs[] = {
+		&fw->istr, &fw->ila, &fw->aap1, &fw->iop,
+	};
+	unsigned int i;
+	int rc;
+
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		rc = request_firmware(imgs[i], names[i], pm8001_ha->dev);
+		if (rc) {
+			pm8001_dbg(pm8001_ha, FAIL,
+				   "HDA: firmware %s not available: %d\n",
+				   names[i], rc);
+			goto err;
+		}
+		/* lengths are reported to the ILA in 24 bits */
+		if (!(*imgs[i])->size ||
+		    (*imgs[i])->size > ILA_HDA_OFFSET_MASK) {
+			pm8001_dbg(pm8001_ha, FAIL,
+				   "HDA: firmware %s has bad size %zu\n",
+				   names[i], (*imgs[i])->size);
+			rc = -EINVAL;
+			goto err;
+		}
+	}
+	return 0;
+err:
+	pm8001_hda_release_fw(fw);
+	return rc;
+}
+
+// flashless
+static int pm8001_chip_soft_rst_sig(struct pm8001_hba_info *pm8001_ha,
+				    u32 signature);
+
+// flashless - see 2.6 pm8001_chip_hda_mode
+static int pm8001_chip_hda_load_fw(struct pm8001_hba_info *pm8001_ha)
+{
+	struct pm8001_hda_fw fw = {};
+	unsigned long timeout;
+	u32 args[2];
+	u32 offset;
+	int rc;
+
+    /* Grab all firmware so that we don't leave the controller in some half baked state if missing */
+	rc = pm8001_hda_request_fw(pm8001_ha, &fw);
+	if (rc)
+		return rc;
+
+	pm8001_info(pm8001_ha,
+		    "flashless boot: loading firmware from host (istr %zu, ila %zu, aap1 %zu, iop %zu bytes)\n",
+		    fw.istr->size, fw.ila->size, fw.aap1->size, fw.iop->size);
+
+	/* Try soft reset to put it into HDA mode */
+	if (pm8001_chip_soft_rst_sig(pm8001_ha, SPC_HDASOFT_RESET_SIGNATURE)) {
+		rc = -EIO;
+		goto out;
+	}
+
+	/* HDA Mode - Clear ODMR and ODCR */
+	pm8001_cw32(pm8001_ha, 0, MSGU_ODCR, ODCR_CLEAR_ALL);
+	pm8001_cw32(pm8001_ha, 0, MSGU_ODMR, ODMR_CLEAR_ALL);
+
+	/* Step 1: Poll HDA_RSP_IDLE - HDA mode */
+	timeout = jiffies + msecs_to_jiffies(PM8001_HDA_TIMEOUT_MS);
+	while (!pm8001_hda_idle(pm8001_ha)) {
+		if (time_after(jiffies, timeout)) {
+			pm8001_dbg(pm8001_ha, FAIL,
+				   "HDA: boot ROM did not enter HDA mode\n");
+			rc = -ETIMEDOUT;
+			goto out;
+		}
+		msleep(PM8001_HDA_POLL_MS);
+	}
+	pm8001_dbg(pm8001_ha, INIT, "HDA Mode!\n");
+
+	/* Step 2: Push the init string to GSM 0x0047E000 */
+	rc = pm8001_hda_gsm_copy(pm8001_ha,
+				 GSM_HDA_ILA_STR_BASE + GSM_ILA_STR_OFFSET,
+				 fw.istr->data, fw.istr->size);
+	if (rc)
+		goto out;
+
+	/* Tell FW ISTR is ready */
+	pm8001_cw32(pm8001_ha, 0, MSGU_HOST_SCRATCH_PAD_3,
+		    ((u32)ILA_HDA_ISTR_IMG_DONE << 24) | (u32)fw.istr->size);
+
+	/* Step 3: Write the HDA mode SoftReset signature */
+	pm8001_cw32(pm8001_ha, 0, MSGU_HOST_SCRATCH_PAD_0,
+		    SPC_HDASOFT_RESET_SIGNATURE);
+
+	/* Step 4: Push the ILA image to 0x00400000 */
+	rc = pm8001_hda_gsm_copy(pm8001_ha,
+				 GSM_HDA_ILA_BASE + GSM_HDA_ILA_OFFSET,
+				 fw.ila->data, fw.ila->size);
+	if (rc)
+		goto out;
+
+	/* Step 5: Tell boot ROM to authenticate ILA and execute it */
+	args[0] = 0;
+	args[1] = fw.ila->size;
+	pm8001_hda_send_cmd(pm8001_ha, args, ARRAY_SIZE(args), HDAC_CMD_EXEC);
+
+	/*
+	 * Step 6: Checking response status from boot ROM,
+	 *         HDAR_EXEC (good), HDAR_BAD_CMD and HDAR_BAD_IMG
+	 */
+	rc = pm8001_hda_wait_exec_rsp(pm8001_ha);
+	if (rc)
+		goto out;
+
+	/* Step 7: Poll ILAHDA_AAP1IMGGET/Offset in MSGU Scratchpad 0 */
+	/* Check MSGU Scratchpad 1 [1,0] == 00 */
+	/* Step 8: Copy AAP1 image, update the Host Scratchpad 3 */
+	rc = pm8001_hda_poll_ila(pm8001_ha, ILA_HDA_AAP1_IMG_GET, &offset);
+	if (rc)
+		goto out;
+	rc = pm8001_hda_gsm_copy(pm8001_ha, GSM_HDA_ILA_BASE + offset,
+				 fw.aap1->data, fw.aap1->size);
+	if (rc)
+		goto out;
+	pm8001_cw32(pm8001_ha, 0, MSGU_HOST_SCRATCH_PAD_3,
+		    ((u32)ILA_HDA_AAP1_IMG_DONE << 24) | (u32)fw.aap1->size);
+
+	/* Step 9: Poll ILAHDA_IOPIMGGET/Offset in MSGU Scratchpad 0 */
+	/* Step 10: Copy IOP image, update the Host Scratchpad 3 */
+	rc = pm8001_hda_poll_ila(pm8001_ha, ILA_HDA_IOP_IMG_GET, &offset);
+	if (rc)
+		goto out;
+	rc = pm8001_hda_gsm_copy(pm8001_ha, GSM_HDA_ILA_BASE + offset,
+				 fw.iop->data, fw.iop->size);
+	if (rc)
+		goto out;
+	pm8001_cw32(pm8001_ha, 0, MSGU_HOST_SCRATCH_PAD_3,
+		    ((u32)ILA_HDA_IOP_IMG_DONE << 24) | (u32)fw.iop->size);
+
+	/* Clear the signature */
+	pm8001_cw32(pm8001_ha, 0, MSGU_HOST_SCRATCH_PAD_0, 0);
+
+	/* step 11: wait for the FW and IOP to get ready - 1 sec timeout */
+	/* Wait for the SPC Configuration Table to be ready */
+	rc = pm8001_hda_wait_fw_ready(pm8001_ha);
+	if (!rc)
+		pm8001_info(pm8001_ha, "flashless boot complete\n");
+out:
+	pm8001_hda_release_fw(&fw);
+	return rc;
+}
+
+// flashless
+static bool pm8001_hda_detect(struct pm8001_hba_info *pm8001_ha)
+{
+	u32 flags;
+
+	if (pm8001_flashless == PM8001_FLASHLESS_OFF ||
+	    !pm8001_hda_is_flashless(pm8001_ha))
+		return false;
+	if (pm8001_flashless == PM8001_FLASHLESS_FORCE)
+		return true;
+
+	if (check_fw_ready(pm8001_ha) == 0) {
+		init_pci_device_addresses(pm8001_ha);
+		flags = pm8001_mr32(pm8001_ha->main_cfg_tbl_addr,
+				    MAIN_HDA_FLAGS_OFFSET);
+		pm8001_dbg(pm8001_ha, INIT, "HDA flags 0x%x\n", flags);
+		return flags & (MAIN_HDA_FLAGS_FORCE_HDA | MAIN_HDA_FLAGS_HDA_FW);
+	}
+
+	if (pm8001_hda_idle(pm8001_ha)) {
+		pm8001_dbg(pm8001_ha, INIT,
+			   "HDA: boot ROM is waiting for firmware\n");
+		return true;
+	}
+	return false;
+}
+
+// flashless - see 2.6 pm8001_chip_init
 static int pm8001_chip_init(struct pm8001_hba_info *pm8001_ha)
 {
 	u32 i = 0;
@@ -660,7 +1034,12 @@ static int pm8001_chip_init(struct pm8001_hba_info *pm8001_ha)
 		}
 	}
 	/* check the firmware status */
-	if (-1 == check_fw_ready(pm8001_ha)) {
+	if (pm8001_ha->hda_mode) {
+		if (pm8001_hda_wait_fw_ready(pm8001_ha)) {
+			pm8001_dbg(pm8001_ha, FAIL, "Firmware is not ready!\n");
+			return -EBUSY;
+		}
+	} else if (-1 == check_fw_ready(pm8001_ha)) {
 		pm8001_dbg(pm8001_ha, FAIL, "Firmware is not ready!\n");
 		return -EBUSY;
 	}
@@ -810,24 +1189,30 @@ static u32 soft_reset_ready_check(struct pm8001_hba_info *pm8001_ha)
 	return 0;
 }
 
+// flashless, required as we need to send both SPC_HDASOFT_RESET_SIGNATURE / SPC_SOFT_RESET_SIGNATURE
 /**
- * pm8001_chip_soft_rst - soft reset the PM8001 chip, so that the clear all
+ * pm8001_chip_soft_rst_sig - soft reset the PM8001 chip, so that the clear all
  * the FW register status to the originated status.
  * @pm8001_ha: our hba card information
+ * @signature: host scratch pad0 signature. mainline was SPC_SOFT_RESET_SIGNATURE
+ * but we also need to send SPC_HDASOFT_RESET_SIGNATURE for flashless HBAs
  */
 static int
-pm8001_chip_soft_rst(struct pm8001_hba_info *pm8001_ha)
+pm8001_chip_soft_rst_sig(struct pm8001_hba_info *pm8001_ha, u32 signature)
 {
 	u32	regVal, toggleVal;
 	u32	max_wait_count;
 	u32	regVal1, regVal2, regVal3;
-	u32	signature = 0x252acbcd; /* for host scratch pad0 */
 	unsigned long flags;
 
 	/* step1: Check FW is ready for soft reset */
-	if (soft_reset_ready_check(pm8001_ha) != 0) {
+	if (pm8001_hda_idle(pm8001_ha)) {
+		pm8001_dbg(pm8001_ha, INIT,
+			   "HDA: boot ROM idle, skipping FW ready check\n");
+	} else if (soft_reset_ready_check(pm8001_ha) != 0) {
 		pm8001_dbg(pm8001_ha, FAIL, "FW is not ready\n");
-		return -1;
+		if (signature != SPC_HDASOFT_RESET_SIGNATURE)
+			return -1;
 	}
 
 	/* step 2: clear NMI status register on AAP1 and IOP, write the same
@@ -1056,71 +1441,99 @@ pm8001_chip_soft_rst(struct pm8001_hba_info *pm8001_ha)
 	/* step 14: delay 10 usec - Normal Mode */
 	udelay(10);
 	/* check Soft Reset Normal mode or Soft Reset HDA mode */
-	if (signature == SPC_SOFT_RESET_SIGNATURE) {
-		/* step 15 (Normal Mode): wait until scratch pad1 register
-		bit 2 toggled */
-		max_wait_count = 2 * 1000 * 1000;/* 2 sec */
-		do {
-			udelay(1);
-			regVal = pm8001_cr32(pm8001_ha, 0, MSGU_SCRATCH_PAD_1) &
-				SCRATCH_PAD1_RST;
-		} while ((regVal != toggleVal) && (--max_wait_count));
+	if (signature != SPC_SOFT_RESET_SIGNATURE) {
+		pm8001_bar4_shift(pm8001_ha, 0);
+		spin_unlock_irqrestore(&pm8001_ha->lock, flags);
+		msleep(200);
+		pm8001_dbg(pm8001_ha, INIT, "SPC HDA soft reset Complete\n");
+		return 0;
+	}
 
-		if (!max_wait_count) {
-			regVal = pm8001_cr32(pm8001_ha, 0,
-				MSGU_SCRATCH_PAD_1);
-			pm8001_dbg(pm8001_ha, FAIL, "TIMEOUT : ToggleVal 0x%x,MSGU_SCRATCH_PAD1 = 0x%x\n",
-				   toggleVal, regVal);
-			pm8001_dbg(pm8001_ha, FAIL,
-				   "SCRATCH_PAD0 value = 0x%x\n",
-				   pm8001_cr32(pm8001_ha, 0,
-					       MSGU_SCRATCH_PAD_0));
-			pm8001_dbg(pm8001_ha, FAIL,
-				   "SCRATCH_PAD2 value = 0x%x\n",
-				   pm8001_cr32(pm8001_ha, 0,
-					       MSGU_SCRATCH_PAD_2));
-			pm8001_dbg(pm8001_ha, FAIL,
-				   "SCRATCH_PAD3 value = 0x%x\n",
-				   pm8001_cr32(pm8001_ha, 0,
-					       MSGU_SCRATCH_PAD_3));
-			spin_unlock_irqrestore(&pm8001_ha->lock, flags);
-			return -1;
-		}
+	/* step 15 (Normal Mode): wait until scratch pad1 register
+	bit 2 toggled */
+	max_wait_count = 2 * 1000 * 1000;
+	do {
+		udelay(1);
+		regVal = pm8001_cr32(pm8001_ha, 0, MSGU_SCRATCH_PAD_1) &
+			SCRATCH_PAD1_RST;
+	} while ((regVal != toggleVal) && (--max_wait_count));
 
-		/* step 16 (Normal) - Clear ODMR and ODCR */
-		pm8001_cw32(pm8001_ha, 0, MSGU_ODCR, ODCR_CLEAR_ALL);
-		pm8001_cw32(pm8001_ha, 0, MSGU_ODMR, ODMR_CLEAR_ALL);
+	if (!max_wait_count) {
+		regVal = pm8001_cr32(pm8001_ha, 0, MSGU_SCRATCH_PAD_1);
+		pm8001_dbg(pm8001_ha, FAIL, "TIMEOUT : ToggleVal 0x%x,MSGU_SCRATCH_PAD1 = 0x%x\n",
+			   toggleVal, regVal);
+		pm8001_dbg(pm8001_ha, FAIL, "SCRATCH_PAD0 value = 0x%x\n",
+			   pm8001_cr32(pm8001_ha, 0, MSGU_SCRATCH_PAD_0));
+		pm8001_dbg(pm8001_ha, FAIL, "SCRATCH_PAD2 value = 0x%x\n",
+			   pm8001_cr32(pm8001_ha, 0, MSGU_SCRATCH_PAD_2));
+		pm8001_dbg(pm8001_ha, FAIL, "SCRATCH_PAD3 value = 0x%x\n",
+			   pm8001_cr32(pm8001_ha, 0, MSGU_SCRATCH_PAD_3));
+		spin_unlock_irqrestore(&pm8001_ha->lock, flags);
+		return -1;
+	}
 
-		/* step 17 (Normal Mode): wait for the FW and IOP to get
-		ready - 1 sec timeout */
-		/* Wait for the SPC Configuration Table to be ready */
-		if (check_fw_ready(pm8001_ha) == -1) {
-			regVal = pm8001_cr32(pm8001_ha, 0, MSGU_SCRATCH_PAD_1);
-			/* return error if MPI Configuration Table not ready */
-			pm8001_dbg(pm8001_ha, INIT,
-				   "FW not ready SCRATCH_PAD1 = 0x%x\n",
-				   regVal);
-			regVal = pm8001_cr32(pm8001_ha, 0, MSGU_SCRATCH_PAD_2);
-			/* return error if MPI Configuration Table not ready */
-			pm8001_dbg(pm8001_ha, INIT,
-				   "FW not ready SCRATCH_PAD2 = 0x%x\n",
-				   regVal);
-			pm8001_dbg(pm8001_ha, INIT,
-				   "SCRATCH_PAD0 value = 0x%x\n",
-				   pm8001_cr32(pm8001_ha, 0,
-					       MSGU_SCRATCH_PAD_0));
-			pm8001_dbg(pm8001_ha, INIT,
-				   "SCRATCH_PAD3 value = 0x%x\n",
-				   pm8001_cr32(pm8001_ha, 0,
-					       MSGU_SCRATCH_PAD_3));
-			spin_unlock_irqrestore(&pm8001_ha->lock, flags);
-			return -1;
-		}
+	/* step 16 (Normal) - Clear ODMR and ODCR */
+	pm8001_cw32(pm8001_ha, 0, MSGU_ODCR, ODCR_CLEAR_ALL);
+	pm8001_cw32(pm8001_ha, 0, MSGU_ODMR, ODMR_CLEAR_ALL);
+
+	/* step 17 (Normal Mode): wait for the FW and IOP to get
+	ready - 1 sec timeout */
+	/* Wait for the SPC Configuration Table to be ready */
+	if (check_fw_ready(pm8001_ha) == -1) {
+		regVal = pm8001_cr32(pm8001_ha, 0, MSGU_SCRATCH_PAD_1);
+		/* return error if MPI Configuration Table not ready */
+		pm8001_dbg(pm8001_ha, INIT, "FW not ready SCRATCH_PAD1 = 0x%x\n",
+			   regVal);
+		regVal = pm8001_cr32(pm8001_ha, 0, MSGU_SCRATCH_PAD_2);
+		/* return error if MPI Configuration Table not ready */
+		pm8001_dbg(pm8001_ha, INIT, "FW not ready SCRATCH_PAD2 = 0x%x\n",
+			   regVal);
+		pm8001_dbg(pm8001_ha, INIT, "SCRATCH_PAD0 value = 0x%x\n",
+			   pm8001_cr32(pm8001_ha, 0, MSGU_SCRATCH_PAD_0));
+		pm8001_dbg(pm8001_ha, INIT, "SCRATCH_PAD3 value = 0x%x\n",
+			   pm8001_cr32(pm8001_ha, 0, MSGU_SCRATCH_PAD_3));
+		spin_unlock_irqrestore(&pm8001_ha->lock, flags);
+		return -1;
 	}
 	pm8001_bar4_shift(pm8001_ha, 0);
 	spin_unlock_irqrestore(&pm8001_ha->lock, flags);
 
 	pm8001_dbg(pm8001_ha, INIT, "SPC soft reset Complete\n");
+	return 0;
+}
+
+// flashless, wrapper for mainline's pm8001_chip_soft_rst w/hardcoded SPC_SOFT_RESET_SIGNATURE signature
+static int pm8001_chip_soft_rst(struct pm8001_hba_info *pm8001_ha)
+{
+	int rc;
+
+	if (!pm8001_ha->hda_mode && pm8001_hda_detect(pm8001_ha)) {
+		pm8001_info(pm8001_ha, "using flashless (HDA) firmware boot\n");
+		pm8001_ha->hda_mode = true;
+	}
+
+	if (!pm8001_ha->hda_mode) {
+		rc = pm8001_chip_soft_rst_sig(pm8001_ha,
+					      SPC_SOFT_RESET_SIGNATURE);
+		if (!rc || pm8001_flashless == PM8001_FLASHLESS_OFF ||
+		    !pm8001_hda_idle(pm8001_ha))
+			return rc;
+		/*
+		 * The reset went through but the boot ROM found nothing to
+		 * boot: the flash image is gone or unusable. Fall back to
+		 * loading the firmware from the host.
+		 */
+		pm8001_info(pm8001_ha,
+			    "soft reset left the boot ROM in HDA mode, falling back to flashless firmware boot\n");
+		pm8001_ha->hda_mode = true;
+	}
+
+	rc = pm8001_chip_hda_load_fw(pm8001_ha);
+	if (rc) {
+		pm8001_dbg(pm8001_ha, FAIL,
+			   "flashless firmware boot failed: %d\n", rc);
+		return -1;
+	}
 	return 0;
 }
 

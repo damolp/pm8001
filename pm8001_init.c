@@ -68,6 +68,13 @@ static bool pm8001_read_wwn = true;
 module_param_named(read_wwn, pm8001_read_wwn, bool, 0444);
 MODULE_PARM_DESC(zoned, "Get WWN from the controller. Default: true");
 
+int pm8001_flashless = PM8001_FLASHLESS_AUTO;
+module_param_named(flashless, pm8001_flashless, int, 0444);
+MODULE_PARM_DESC(flashless, "Flashless Firmware mode\n"
+		" 0: disabled\n"
+		" 1: auto (default)\n"
+		" 2: force\n");
+
 static struct scsi_transport_template *pm8001_stt;
 static int pm8001_init_ccb_tag(struct pm8001_hba_info *);
 
@@ -1572,4 +1579,8 @@ MODULE_DESCRIPTION(
 MODULE_VERSION(DRV_VERSION);
 MODULE_LICENSE("GPL");
 MODULE_DEVICE_TABLE(pci, pm8001_pci_table);
+MODULE_FIRMWARE(PM8001_FW_ISTR);
+MODULE_FIRMWARE(PM8001_FW_ILA);
+MODULE_FIRMWARE(PM8001_FW_AAP1);
+MODULE_FIRMWARE(PM8001_FW_IOP);
 

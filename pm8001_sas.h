@@ -85,6 +85,19 @@ do {									\
 
 extern bool pm8001_use_msix;
 
+enum pm8001_flashless_mode {
+	PM8001_FLASHLESS_OFF	= 0, // ignore flashless mode
+	PM8001_FLASHLESS_AUTO	= 1, // send flashless firmware if controller asks for it
+	PM8001_FLASHLESS_FORCE	= 2, // force send flashless firmware
+};
+extern int pm8001_flashless;
+
+// firmware blobs
+#define PM8001_FW_ISTR		"pm8001/istrimg.bin"
+#define PM8001_FW_ILA		"pm8001/ilaimg.bin"
+#define PM8001_FW_AAP1		"pm8001/aap1img.bin"
+#define PM8001_FW_IOP		"pm8001/iopimg.bin"
+
 #define IS_SPCV_12G(dev)	((dev->device == 0X8074)		\
 				|| (dev->device == 0X8076)		\
 				|| (dev->device == 0X8077)		\
@@ -529,6 +542,7 @@ struct pm8001_hba_info {
 	u32			smp_exp_mode;
 	bool			controller_fatal_error;
 	const struct firmware 	*fw_image;
+	bool			hda_mode; // flashless mode
 	struct isr_param irq_vector[PM8001_MAX_MSIX_VEC];
 	u32			non_fatal_count;
 	u32			non_fatal_read_length;

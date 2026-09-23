@@ -918,6 +918,11 @@ struct set_dev_state_resp {
 #define MAIN_HDA_FLAGS_OFFSET		0x84/* DWORD 0x21 */
 #define MAIN_ANALOG_SETUP_OFFSET	0x88/* DWORD 0x22 */
 
+// flashless mode - from github.com/Seagate/pm8001
+#define MAIN_HDA_FLAGS_BOOTSTRAP_MASK	0x00000003
+#define MAIN_HDA_FLAGS_FORCE_HDA	0x00000004
+#define MAIN_HDA_FLAGS_HDA_FW		0x00000008
+
 /* Gereral Status Table offset - byte offset */
 #define GST_GSTLEN_MPIS_OFFSET		0x00
 #define GST_IQ_FREEZE_STATE0_OFFSET	0x04
@@ -952,6 +957,8 @@ struct set_dev_state_resp {
 /* signature definition for host scratch pad0 register */
 #define SPC_SOFT_RESET_SIGNATURE	0x252acbcd
 /* Signature for Soft Reset */
+/* Signature for HDA Soft Reset without PCIe resetting */
+#define SPC_HDASOFT_RESET_SIGNATURE	0xa5aa27d7
 
 /* SPC Reset register - BAR4(0x20), BAR2(win) (need dynamic mapping) */
 #define SPC_REG_RESET			0x000000/* reset register */
@@ -1007,6 +1014,46 @@ struct set_dev_state_resp {
 #define GSM_CONFIG_RESET_VALUE          0x00003b00
 #define GPIO_ADDR_BASE                  0x00090000
 #define GPIO_GPIO_0_0UTPUT_CTL_OFFSET   0x0000010c
+
+// begin flashless - from github.com/Seagate/pm8001
+#define HDA_CMD_OFFSET			0xfec0
+#define HDA_RSP_OFFSET			0xfee0
+#define HDA_CMD_RSP_CODE_DW		28
+#define HDAC_CMD_BUF_INFO		0x0001
+#define HDAC_CMD_EXEC			0x0002
+#define HDAC_CMD_RESET			0x0003
+#define HDA_R_PA			0xdb
+#define HDA_PA_BITS			0xff000000
+#define HDA_CODE_BITS			0x0000ffff
+#define HDA_RSP_BUF_INFO		0x8001
+#define HDA_RSP_IDLE			0x8002
+#define HDA_RSP_BAD_IMG			0x8003
+#define HDA_RSP_BAD_CMD			0x8004
+#define HDA_RSP_INTL_ERR		0x8005
+#define HDA_RSP_EXEC			0x8006
+
+#define ILA_HDA_STATE_MASK		0xFF000000
+#define ILA_HDA_OFFSET_MASK		0x00FFFFFF
+#define ILA_HDA_IOP_IMG_GET		0x10
+#define ILA_HDA_AAP1_IMG_GET		0x11
+#define ILA_HDA_AAP2_IMG_GET		0x12
+#define ILA_HDA_EXITGOOD		0x1F
+#define ILA_HDA_IOP_IMG_DONE		0x80
+#define ILA_HDA_AAP1_IMG_DONE		0x81
+#define ILA_HDA_ISTR_IMG_DONE		0x83
+
+#define GSM_HDA_ILA_STR_BASE		0x470000
+#define GSM_ILA_STR_OFFSET		0xE000
+#define GSM_HDA_ILA_BASE		0x400000
+#define GSM_HDA_ILA_OFFSET		0x0
+#define SIZE_64KB			0x00010000
+#define MB3_SHIFT_MASK			0xFFFF0000
+#define MB3_OFFSET_MASK			0x0000FFFF
+
+#define PM8001_HDA_POLL_MS		10
+#define PM8001_HDA_TIMEOUT_MS		2000
+// end flashless - from github.com/Seagate/pm8001
+
 
 /* RB6 offset */
 #define SPC_RB6_OFFSET			0x80C0
